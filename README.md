@@ -1,143 +1,99 @@
-# Real-Time Analytics & Observability Platform
+# Real-Time Analytics Platform
 
-A real-time event analytics platform that ingests application events through Apache Kafka, processes streaming data with Python, and exposes analytics through a backend API and interactive dashboards.
+A Python event pipeline: generate application events, send them through Kafka, persist them in PostgreSQL, and query traffic, response-time, and error summaries through FastAPI.
 
-## Overview
+**Implemented stack:** Python, kafka-python, Apache Kafka, psycopg2, PostgreSQL, FastAPI, and Docker Compose for local infrastructure. There is no Go service, Redis integration, React dashboard, or Grafana configuration in this repository.
 
-This project demonstrates a production-style streaming analytics pipeline for collecting, processing, storing, and visualizing application events in real time.
+**Performance status:** the previously cited 5,000+ events/sec, sub-two-second aggregation, 500,000 events, six consumers, and 99%+ success are not verified by repository benchmark evidence. The original producer slept 0.5 seconds and flushed every message; that is a demonstration workload of at most about two events/sec, not a throughput test.
 
-The platform is designed to answer questions such as:
+## Engineering behavior
 
-* How many events are being generated?
-* Which event types are most common?
-* How many errors are occurring?
-* What is the average response time?
-* How many unique users are active?
-* Which pages receive the most activity?
+- Bounded producer with asynchronous sends, batched broker flush, acknowledgement checks, optional rate control, and a run UUID.
+- Strict event validation: UUIDs, timezone-aware timestamps, bounded strings/numbers, known event types, and a 16 KiB consumer payload limit.
+- Consumer polls up to 500 records, writes one database transaction, then commits explicit Kafka partition offsets. Database failure stops processing without acknowledging that batch.
+- Unique `event_id` storage makes replay idempotent. Malformed events are quarantined by topic/partition/offset; payloads are not retained or logged.
+- Bounded consumer memory; database-derived summaries replace unbounded in-memory user sets and per-event console output.
+- Schema initialization, configuration examples, SQL timeouts, connection cleanup, dependency-aware readiness, safe 503 errors, metrics, and tests.
+
+See [validation](docs/VALIDATION.md) for executed checks and unverified integrations.
 
 ## Architecture
 
-```text
-Event Generator
-      │
-      ▼
-   Apache Kafka
-      │
-      ▼
- Python Consumer
-      │
-      ├──────────► PostgreSQL
-      │
-      └──────────► Redis
-                     │
-                     ▼
-                  FastAPI
-                     │
-                     ▼
-              React Dashboard
-
-              Grafana
-                 │
-                 ▼
-        System Monitoring
+```mermaid
+flowchart TD
+  P[Python producer] --> K[Kafka topic: 3 partitions]
+  K --> C[Python consumer group]
+  C --> V[Validation]
+  V --> E[PostgreSQL events]
+  V --> R[PostgreSQL rejected events]
+  E --> A[FastAPI SQL summaries]
+  R --> M[Metrics endpoint]
+  E --> M
 ```
 
-## Tech Stack
+Offsets are acknowledged **after** the SQL transaction. A crash between SQL commit and offset commit replays the batch; `ON CONFLICT DO NOTHING` suppresses duplicate event rows. This is at-least-once processing with idempotent storage, not a distributed exactly-once transaction. A failed Kafka commit also exits, allowing replay after restart. Rejected events must be stored successfully before their offsets advance. Raw rejected payloads are discarded, so there is no payload replay tool yet.
 
-* **Python** — event generation, stream processing, backend services
-* **Apache Kafka** — event streaming and message ingestion
-* **PostgreSQL** — persistent analytics storage
-* **Redis** — fast-access counters and cached metrics
-* **FastAPI** — analytics REST API
-* **React** — interactive dashboard
-* **Grafana** — monitoring and observability
-* **Docker** — local infrastructure and service orchestration
+## Reproducible local setup
 
-## Current Progress
-
-### Completed
-
-* Kafka infrastructure running with Docker
-* Python event producer
-* Kafka topic for analytics events
-* Python Kafka consumer
-* Event serialization/deserialization
-* Streaming events between producer and consumer
-
-### In Progress
-
-* Real-time metric aggregation
-* PostgreSQL persistence
-* Redis counters and caching
-* FastAPI analytics endpoints
-* React analytics dashboard
-* Grafana monitoring
-
-## Example Event
-
-```json
-{
-  "event_id": "example-event-id",
-  "user_id": "user_42",
-  "event_type": "page_view",
-  "page": "/dashboard",
-  "response_time_ms": 245,
-  "status_code": 200,
-  "timestamp": "2026-09-01T18:30:00+00:00"
-}
-```
-
-## Planned Analytics
-
-The platform will calculate:
-
-* Total events
-* Events per minute
-* Events by event type
-* Error count and error rate
-* Average response time
-* Unique users
-* Events by page
-* Top active users/pages
-* Time-series event activity
-
-## Running Locally
-
-### 1. Start Kafka
+Requires Python 3.12+, Docker Engine, and Docker Compose v2. Run Python processes on the host: Kafka advertises `localhost:9092`.
 
 ```bash
-docker compose up -d
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.lock
+cp .env.example .env
+# Edit BOTH password placeholders consistently before continuing.
+set -a
+. ./.env
+set +a
+docker compose up -d --wait
+# For a fresh volume, Compose initializes sql/schema.sql automatically.
+python -m common.storage
+python -m consumer.main
 ```
 
-### 2. Start the producer
+In another terminal, activate the same virtual environment and export the same `.env` values, then run:
 
 ```bash
-python3 producer/main.py
+python -m producer.main --count 100 --rate 2
+uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
-### 3. Start the consumer
+The schema script is idempotent for the new schema; it is **not** a migration for an existing manually created `events` table. Existing installations must add UUID keys, `run_id`, and `ingested_at` through a reviewed migration. Do not discard data to work around schema mismatch.
+
+Docker Compose reads `.env` for infrastructure interpolation. Python reads process environment only; the explicit shell export is required. Never commit `.env`. Infrastructure ports bind to loopback. The one-node plaintext broker is a local demonstration; it is not suitable for public hosting or high availability. Kafka data is ephemeral; PostgreSQL uses a named volume. `docker compose down` stops services without deleting the PostgreSQL volume.
+
+## API and instrumentation
 
 ```bash
-python3 consumer/main.py
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/ready
+curl http://127.0.0.1:8000/analytics/summary
+curl http://127.0.0.1:8000/analytics/event-types
+curl http://127.0.0.1:8000/analytics/pages
+curl http://127.0.0.1:8000/metrics
 ```
 
-The producer generates application events and publishes them to Kafka. The consumer reads those events from the `analytics-events` topic for processing.
+`/health` is process liveness; `/ready` checks the event table. Summary values include stored event count, unique users, average response time, error count, and percentage error rate. SQL empty-table summaries return zero. `/metrics` exports database-backed gauges for stored and rejected rows, not Kafka lag or a latency histogram. Consumer JSON logs record batch size, inserts, duplicates, rejections, and elapsed time. Dependency failures log error types without connection strings or raw events. Swagger UI is at `/docs`.
 
-## Roadmap
+## Verification and measurement
 
-* [x] Kafka infrastructure
-* [x] Event producer
-* [x] Event consumer
-* [x] Streaming metric aggregation
-* [x] PostgreSQL data storage
-* [x] Redis caching
-* [x] FastAPI analytics API
-* [ ] React dashboard
-* [ ] Grafana observability
-* [ ] Load testing and performance benchmarking
-* [ ] Automated tests and CI
+```bash
+python -m pytest -q -m 'not integration' --cov=common --cov=consumer --cov=producer --cov=api
+ruff check .
+ruff format --check .
+# With local Kafka/PostgreSQL ready:
+RUN_INTEGRATION=1 python -m pytest -q -m integration
+python -m benchmarks.pipeline --count 10000 --rate 0 --drain-timeout 60 \
+  --output benchmarks/results/run.json
+```
 
-## Goal
+See [benchmark methodology](benchmarks/README.md). GitHub Actions defines unit and service-integration jobs, including a small end-to-end benchmark smoke run. A workflow definition is not evidence of a successful remote run. The review environment has no Docker runtime; actual Kafka/PostgreSQL execution and throughput remain unverified there.
 
-Build a complete real-time analytics pipeline that demonstrates practical experience with streaming systems, backend development, data processing, databases, observability, and scalable application architecture.
+## Trade-offs and remaining gaps
 
+Batching reduces SQL and broker round trips but adds queueing delay. PostgreSQL is the single durable sink, simplifying truth for analytics; full-table aggregates will need time windows or materialized rollups at scale. Three partitions bound useful parallel consumers in one group to three. Connections are opened per API request with a five-second connect timeout and ten-second statement timeout; pooling and concurrency limits remain future work.
+
+Next: verify the entire stack; add failure/restart and consumer-rebalance tests; measure lag, drain time, p95/p99 latency, duplicates, and rejection rate; add schema migrations and retention; then consider Redis or a dashboard if measurements justify them. Authentication, TLS, broker replication, access control, durable Kafka volumes, alerting, and production deployment are not implemented. No deployment is published by these changes.
+
+`requirements.lock` pins the full Python 3.12 development environment used for validation. `requirements-dev.txt` and the runtime requirements describe direct dependencies; regenerate the lock deliberately when updating them.
