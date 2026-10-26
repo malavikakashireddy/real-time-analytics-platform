@@ -79,7 +79,7 @@ curl http://127.0.0.1:8000/metrics
 ## Verification and measurement
 
 ```bash
-python -m pytest -q -m 'not integration' --cov=common --cov=consumer --cov=producer --cov=api
+python -m pytest -q -m 'not integration' --cov=common --cov=consumer --cov=producer --cov=api --cov=benchmarks
 ruff check .
 ruff format --check .
 # With local Kafka/PostgreSQL ready:
@@ -88,7 +88,7 @@ python -m benchmarks.pipeline --count 10000 --rate 0 --drain-timeout 60 \
   --output benchmarks/results/run.json
 ```
 
-See [benchmark methodology](benchmarks/README.md). GitHub Actions defines unit and service-integration jobs, including a small end-to-end benchmark smoke run. A workflow definition is not evidence of a successful remote run. The review environment has no Docker runtime; actual Kafka/PostgreSQL execution and throughput remain unverified there.
+See [benchmark methodology](benchmarks/README.md). GitHub Actions defines unit and service-integration jobs, including a small end-to-end benchmark smoke run. A workflow definition is not evidence of a successful remote run. The local review environment has no Docker runtime. GitHub CI subsequently passed real PostgreSQL integration and a 500-event Kafka-to-database smoke at an imposed 100 events/sec. See validation evidence for that limited result; sustained capacity and the original resume numbers remain unverified.
 
 ## Trade-offs and remaining gaps
 

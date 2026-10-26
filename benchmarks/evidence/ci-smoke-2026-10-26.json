@@ -1,0 +1,33 @@
+{
+  "evidence_url": "https://github.com/malavikakashireddy/real-time-analytics-platform/actions/runs/40400540202",
+  "scope": "CI smoke with imposed 100 events/sec; not a saturation or aggregation benchmark",
+  "result": {
+    "producer": {
+      "run_id": "900473c3-bcd5-42a5-a932-17efa9cd9778",
+      "attempted": 500,
+      "acknowledged": 500,
+      "producer_seconds": 5.002545777000023,
+      "broker_acked_events_per_second": 99.94911037072909,
+      "requested_rate": 100,
+      "python": "3.12.15",
+      "scope": "producer to broker; excludes consumer/database completion"
+    },
+    "persisted_unique_events": 500,
+    "complete": true,
+    "end_to_end_seconds": 5.031806102000019,
+    "persisted_events_per_second": 99.36789889444714,
+    "latency_ms": {
+      "p50": 13.413499999999999,
+      "p95": 122.3823,
+      "p99": 123.13705,
+      "min": 2.949
+    },
+    "clock_skew_detected": false,
+    "revision": "65aba64cbbe59f983368cd1e642ceaf924ba5ef7",
+    "working_tree_dirty": false,
+    "python": "3.12.15",
+    "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39",
+    "logical_cpus": 4,
+    "scope": "synthetic event creation to database INSERT timestamp; not dashboard aggregation"
+  }
+}
