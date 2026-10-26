@@ -1,0 +1,47 @@
+name: Checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -r requirements.lock
+      - run: ruff check . && ruff format --check .
+      - run: python -m pytest -q -m 'not integration'
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    env:
+      POSTGRES_PASSWORD: local-ci-password
+      DATABASE_URL: postgresql://analytics:local-ci-password@localhost:5432/analytics
+      RUN_INTEGRATION: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.lock
+      - run: docker compose up -d --wait
+      - run: python -m pytest -q -m integration
+      - name: Broker to database smoke
+        run: |
+          python -m consumer.main > /tmp/consumer.log 2>&1 &
+          consumer_pid=$!
+          trap 'kill "$consumer_pid" 2>/dev/null || true' EXIT
+          python -m benchmarks.pipeline --count 500 --rate 100 --drain-timeout 60 --output benchmarks/results/ci-smoke.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-results
+          path: benchmarks/results/*.json
+      - if: always()
+        run: docker compose logs && docker compose down

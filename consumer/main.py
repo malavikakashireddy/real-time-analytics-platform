@@ -1,107 +1,98 @@
+"""At-least-once Kafka consumption with idempotent PostgreSQL storage."""
+
 import json
-from collections import Counter
+import logging
+import signal
+import time
 
 import psycopg2
 from kafka import KafkaConsumer
+from kafka.errors import KafkaError
+from kafka.structs import OffsetAndMetadata
+from pydantic import ValidationError
+
+from common.config import bootstrap_servers, group_id, topic
+from common.events import Event
+from common.storage import connect, persist_batch
+
+logger = logging.getLogger(__name__)
+MAX_EVENT_BYTES = 16_384
 
 
-def get_db_connection():
-    return psycopg2.connect(
-        host="localhost",
-        port=5432,
-        database="analytics",
-        user="analytics",
-        password="analytics",
-    )
-
-
-def insert_event(cursor, event):
-    cursor.execute(
-        """
-        INSERT INTO events (
-            event_id,
-            user_id,
-            event_type,
-            page,
-            response_time_ms,
-            status_code,
-            event_timestamp
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (event_id) DO NOTHING;
-        """,
-        (
-            event["event_id"],
-            event["user_id"],
-            event["event_type"],
-            event["page"],
-            event["response_time_ms"],
-            event["status_code"],
-            event["timestamp"],
-        ),
-    )
+def process_poll(consumer, connection, batches):
+    valid, rejected, offsets = [], [], {}
+    polled = 0
+    for partition, messages in batches.items():
+        for message in messages:
+            polled += 1
+            try:
+                if len(message.value) > MAX_EVENT_BYTES:
+                    raise ValueError("oversize")
+                event = Event.model_validate_json(message.value)
+                valid.append(event)
+            except (ValidationError, ValueError):
+                # Store coordinates and a safe reason, never arbitrary payloads or credentials.
+                rejected.append((message.topic, message.partition, message.offset, "invalid_event"))
+            offsets[partition] = OffsetAndMetadata(message.offset + 1, "", -1)
+    if not polled:
+        return {"polled": 0, "inserted": 0, "duplicates": 0, "rejected": 0}
+    inserted = persist_batch(connection, valid, rejected)
+    # Explicit offsets cover only records included in the completed DB transaction.
+    consumer.commit(offsets=offsets)
+    return {
+        "polled": polled,
+        "inserted": inserted,
+        "duplicates": len(valid) - inserted,
+        "rejected": len(rejected),
+    }
 
 
 def main():
-    consumer = KafkaConsumer(
-        "analytics-events",
-        bootstrap_servers="localhost:9092",
-        auto_offset_reset="earliest",
-        group_id="analytics-consumer-group-v3",
-        value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-    )
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    stopping = False
 
-    connection = get_db_connection()
-    cursor = connection.cursor()
+    def stop(signum, frame):
+        nonlocal stopping
+        stopping = True
 
-    total_events = 0
-    total_response_time = 0
-    error_count = 0
-
-    event_type_counts = Counter()
-    page_counts = Counter()
-    unique_users = set()
-
-    print("Real-Time Analytics Consumer")
-    print("Connected to PostgreSQL")
-    print("Waiting for events...\n")
-
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, stop)
+    consumer = None
+    connection = None
     try:
-        for message in consumer:
-            event = message.value
-
-            insert_event(cursor, event)
-            connection.commit()
-
-            total_events += 1
-            total_response_time += event["response_time_ms"]
-
-            event_type_counts[event["event_type"]] += 1
-            page_counts[event["page"]] += 1
-            unique_users.add(event["user_id"])
-
-            if event["status_code"] >= 400:
-                error_count += 1
-
-            average_response_time = total_response_time / total_events
-            error_rate = (error_count / total_events) * 100
-
-            print("\n===== REAL-TIME ANALYTICS =====")
-            print(f"Total Events: {total_events}")
-            print(f"Unique Users: {len(unique_users)}")
-            print(f"Average Response Time: {average_response_time:.2f} ms")
-            print(f"Errors: {error_count}")
-            print(f"Error Rate: {error_rate:.2f}%")
-            print(f"Events by Type: {dict(event_type_counts)}")
-            print(f"Events by Page: {dict(page_counts)}")
-
-    except KeyboardInterrupt:
-        print("\nConsumer stopped.")
-
+        connection = connect()
+        consumer = KafkaConsumer(
+            topic(),
+            bootstrap_servers=bootstrap_servers(),
+            group_id=group_id(),
+            enable_auto_commit=False,
+            auto_offset_reset="earliest",
+            max_poll_records=500,
+            max_poll_interval_ms=300000,
+        )
+        while not stopping:
+            started = time.perf_counter()
+            result = process_poll(
+                consumer, connection, consumer.poll(timeout_ms=1000, max_records=500)
+            )
+            if result["polled"]:
+                logger.info(
+                    json.dumps(
+                        {
+                            "event": "batch_persisted",
+                            **result,
+                            "batch_seconds": time.perf_counter() - started,
+                        }
+                    )
+                )
+    except (KafkaError, psycopg2.Error, OSError, RuntimeError) as exc:
+        logger.error(json.dumps({"event": "consumer_failed", "error_type": type(exc).__name__}))
+        raise SystemExit(1) from None
     finally:
-        cursor.close()
-        connection.close()
-        consumer.close()
+        if consumer:
+            consumer.close(autocommit=False)
+        if connection:
+            connection.close()
 
 
 if __name__ == "__main__":
