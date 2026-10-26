@@ -38,7 +38,13 @@ def benchmark(count, rate, timeout):
                 FROM events WHERE run_id=%s""",
                 (producer["run_id"],),
             )
-            p50, p95, p99, minimum = cursor.fetchone()
+            # PostgreSQL numeric aggregates (notably MIN) may be Decimal.
+            # Normalize every latency field before writing a JSON result.
+            latency = {
+                name: float(value) if value is not None else None
+                for name, value in zip(("p50", "p95", "p99", "min"), cursor.fetchone(), strict=True)
+            }
+            minimum = latency["min"]
         try:
             revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
             dirty = bool(
@@ -52,7 +58,7 @@ def benchmark(count, rate, timeout):
             "complete": persisted == count,
             "end_to_end_seconds": elapsed,
             "persisted_events_per_second": persisted / elapsed,
-            "latency_ms": {"p50": p50, "p95": p95, "p99": p99, "min": minimum},
+            "latency_ms": latency,
             "clock_skew_detected": minimum is not None and minimum < 0,
             "revision": revision,
             "working_tree_dirty": dirty,
